@@ -16,8 +16,10 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Bool, Float32
 from builtin_interfaces.msg import Duration
+from control_msgs.action import GripperCommand
+from rclpy.action import ActionClient
 
 from teleop_xr.ik_utils import ensure_ik_dependencies
 
@@ -78,6 +80,19 @@ class QuestTeleopIKNode(Node):
         self.right_init_fk: jaxlie.SE3 | None = None
         self.tracking_active = False
 
+        # --- Deadman switch (grip button) ---
+        self.grip_pressed = False
+        self.grip_was_pressed = False  # previous state for edge detection
+        self.grip_ever_received = False  # True after first grip message arrives
+
+        # --- Gripper (trigger button) ---
+        self.trigger_value = 0.0  # 0.0 = released, 1.0 = fully pulled
+        self.trigger_ever_received = False
+        self.gripper_max = 0.044  # max opening [m] from URDF
+        self.gripper_pos_cmd = 0.0  # current smoothed gripper position (start closed)
+        self.last_gripper_sent = -1.0  # track last sent value to avoid spamming
+        self.gripper_smoothing = 0.1  # smoothing rate for gripper
+
         # --- State ---
         self.left_pose: PoseStamped | None = None
         self.right_pose: PoseStamped | None = None
@@ -89,6 +104,13 @@ class QuestTeleopIKNode(Node):
         self.create_subscription(PoseStamped, "/q2r_left_hand_pose", self._left_pose_cb, 10)
         self.create_subscription(PoseStamped, "/q2r_right_hand_pose", self._right_pose_cb, 10)
         self.create_subscription(JointState, "/joint_states", self._joint_state_cb, 10)
+        self.create_subscription(Bool, "/q2r_right_grip_pressed", self._grip_cb, 10)
+        self.create_subscription(Float32, "/q2r_right_trigger_value", self._trigger_cb, 10)
+
+        # --- Gripper action client ---
+        self.gripper_client = ActionClient(
+            self, GripperCommand, "/gripper_controller/gripper_cmd"
+        )
 
         # --- Publishers ---
         if self.use_forward:
@@ -118,6 +140,21 @@ class QuestTeleopIKNode(Node):
         with self.lock:
             self.right_pose = msg
 
+    def _trigger_cb(self, msg: Float32):
+        with self.lock:
+            self.trigger_value = msg.data
+            self.trigger_ever_received = True
+
+    def _grip_cb(self, msg: Bool):
+        with self.lock:
+            if not self.grip_ever_received:
+                self.grip_ever_received = True
+                self.get_logger().info("Grip topic received - deadman switch active")
+            old = self.grip_pressed
+            self.grip_pressed = msg.data
+            if old != msg.data:
+                self.get_logger().info(f"Grip: {'PRESSED' if msg.data else 'RELEASED'}")
+
     def _joint_state_cb(self, msg: JointState):
         q = np.array(self.q_current)
         for i, name in enumerate(self.actuated_names):
@@ -135,34 +172,62 @@ class QuestTeleopIKNode(Node):
     def _control_loop(self):
         with self.lock:
             rp = self.right_pose
+            grip = self.grip_pressed
 
         if rp is None:
             return
 
+        # Block until grip topic is available (Unity must send grip state)
+        if not self.grip_ever_received:
+            if self.publish_count == 0:
+                self.get_logger().info("Waiting for /q2r_right_grip_pressed topic... (robot will not move until grip is received)")
+                self.publish_count = -1  # log once
+            return
+
+        # Deadman switch: grip not pressed → hold position, reset origin on next press
+        if not grip:
+            if self.grip_was_pressed:
+                # Grip just released → mark tracking for re-init on next press
+                self.tracking_active = False
+                self.get_logger().info("Grip released - robot stopped (hold position)")
+            self.grip_was_pressed = False
+            return
+
         quest_R = pose_msg_to_se3(rp)
 
-        # Initialize tracking on first valid pose
+        # Initialize/re-initialize tracking when grip is pressed
         if not self.tracking_active:
             self.right_init_pose = quest_R
             fk = self.robot.forward_kinematics(self.q_current)
             self.right_init_fk = fk.get("right")
             if self.right_init_fk is None:
                 return
-            self.cmd_q = np.array(self.q_current)
+            if self.cmd_q is None:
+                self.cmd_q = np.array(self.q_current)
             self.tracking_active = True
-            self.get_logger().info("Tracking started - move Quest controller to move robot")
+            self.grip_was_pressed = True
+            self.get_logger().info("Grip pressed - tracking started (origin reset)")
             return
+
+        self.grip_was_pressed = True
 
         # Compute relative delta from initial Quest pose
         delta = self.right_init_pose.inverse() @ quest_R
         delta_translation = np.array(delta.translation()) * self.speed
+        # Mirror Y axis: operator stands behind the robot, so left/right is flipped
+        delta_translation[1] = -delta_translation[1]
 
         # Safety: clamp workspace radius
         dist = np.linalg.norm(delta_translation)
         if dist > self.max_workspace_radius:
             delta_translation = delta_translation * (self.max_workspace_radius / dist)
 
-        delta_rotation = delta.rotation()
+        # Mirror rotation to match Y-axis flip (negate qy and qz)
+        delta_rot_wxyz = delta.rotation().wxyz
+        delta_rotation = jaxlie.SO3(wxyz=jnp.array([
+            delta_rot_wxyz[0], delta_rot_wxyz[1],
+            -delta_rot_wxyz[2], -delta_rot_wxyz[3]
+        ]))
         scaled_delta = jaxlie.SE3.from_rotation_and_translation(
             delta_rotation, jnp.array(delta_translation)
         )
@@ -208,6 +273,22 @@ class QuestTeleopIKNode(Node):
         if self.publish_count % 250 == 1:
             q_list = [f"{float(self.cmd_q[i]):.3f}" for i in self.right_arm_indices]
             self.get_logger().info(f"#{self.publish_count} joints=[{', '.join(q_list)}]")
+
+        # Gripper: trigger pulled = open, released = closed
+        with self.lock:
+            trigger = self.trigger_value
+            trigger_ready = self.trigger_ever_received
+        if trigger_ready:
+            target_pos = self.gripper_max * trigger  # 0.0 = closed, 1.0 trigger → full open
+            # Smooth gripper movement
+            self.gripper_pos_cmd += self.gripper_smoothing * (target_pos - self.gripper_pos_cmd)
+            # Only send if changed enough to avoid spamming
+            if abs(self.gripper_pos_cmd - self.last_gripper_sent) > 0.0005:
+                self.last_gripper_sent = self.gripper_pos_cmd
+                goal = GripperCommand.Goal()
+                goal.command.position = self.gripper_pos_cmd
+                goal.command.max_effort = 100.0
+                self.gripper_client.send_goal_async(goal)
 
 
 def main(args=None):
