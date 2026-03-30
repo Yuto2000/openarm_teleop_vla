@@ -22,6 +22,7 @@ setup(
     entry_points={
         "console_scripts": [
             "ik_node = openarm_teleop.ik_node:main",
+            "record_node = openarm_teleop.record_node:main",
         ],
     },
 )
