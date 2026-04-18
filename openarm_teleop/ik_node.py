@@ -19,7 +19,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, Float64MultiArray
 from builtin_interfaces.msg import Duration
 from control_msgs.action import GripperCommand
 from rclpy.action import ActionClient
@@ -90,6 +90,8 @@ class ArmTrackingState:
 
 class QuestTeleopIKNode(Node):
     def __init__(self):
+        # When running two instances (arm:=right and arm:=left), remap the
+        # node name via -r __node:=right_ik / left_ik at launch.
         super().__init__("quest_teleop_ik")
 
         # --- Parameters ---
@@ -97,10 +99,26 @@ class QuestTeleopIKNode(Node):
         self.declare_parameter("smoothing", 0.05)
         self.declare_parameter("max_joint_step", 0.02)
         self.declare_parameter("weights_file", "")
+        # arm: "both" (default, legacy bimanual in one process),
+        #      "right" or "left" (this node handles only that arm —
+        #      run two instances to get independent right/left IK).
+        self.declare_parameter("arm", "both")
+        # pose_filter_alpha: EMA coefficient applied to Quest pose.
+        # 1.0 = no filter (raw pose, original behavior).
+        # Smaller = more filtering / smoother = more lag.
+        # At 20Hz pose rate, alpha=0.3 gives ~150ms time constant.
+        self.declare_parameter("pose_filter_alpha", 0.3)
 
         self.use_forward = self.get_parameter("use_forward_controller").value
         self.smoothing = self.get_parameter("smoothing").value
         self.max_joint_step = self.get_parameter("max_joint_step").value
+        self.pose_filter_alpha = float(self.get_parameter("pose_filter_alpha").value)
+        self.arm_side = self.get_parameter("arm").value
+        if self.arm_side not in ("both", "right", "left"):
+            raise ValueError(f"param 'arm' must be both/right/left, got {self.arm_side}")
+        self.handle_right = self.arm_side in ("both", "right")
+        self.handle_left = self.arm_side in ("both", "left")
+        self.get_logger().info(f"arm mode: {self.arm_side}")
 
         # --- Robot & IK setup ---
         self.get_logger().info("Initializing OpenArmRobot + PyrokiSolver (JIT warmup)...")
@@ -111,7 +129,21 @@ class QuestTeleopIKNode(Node):
             self.get_logger().info(f"Loaded teleop config from {weights_path}")
         self.teleop_config = teleop_config
         self.robot = robot_cls(weights=teleop_config.ik_weights)
-        self.solver = PyrokiSolver(self.robot)
+        # Warm up only the IK patterns we actually need for this arm mode
+        # → faster startup and smaller JIT cache.
+        if self.arm_side == "right":
+            warmup_patterns = [(False, True, False)]
+        elif self.arm_side == "left":
+            warmup_patterns = [(True, False, False)]
+        else:
+            # both: need L-only, R-only, and (L,R) combinations for the
+            # independent-solve codepath
+            warmup_patterns = [
+                (False, True, False),
+                (True, False, False),
+                (True, True, False),
+            ]
+        self.solver = PyrokiSolver(self.robot, warmup_patterns=warmup_patterns)
         self.get_logger().info("IK solver ready.")
 
         self.q_current = jnp.array(self.robot.get_default_config())
@@ -138,32 +170,53 @@ class QuestTeleopIKNode(Node):
         self.lock = threading.Lock()
         self.publish_count = 0
         self.cmd_q = None
+        # Guard: only start tracking once we've seen real joint states, otherwise
+        # cmd_q would be initialized from the hardcoded default_config, causing
+        # the arm to snap to that pose on the first publish.
+        self.joint_state_received = False
 
         # --- Subscribers ---
-        self.create_subscription(PoseStamped, "/q2r_right_hand_pose", self._right_pose_cb, 10)
-        self.create_subscription(PoseStamped, "/q2r_left_hand_pose", self._left_pose_cb, 10)
         self.create_subscription(JointState, "/joint_states", self._joint_state_cb, 10)
-        self.create_subscription(Bool, "/q2r_right_grip_pressed", self._right_grip_cb, 10)
-        self.create_subscription(Bool, "/q2r_left_grip_pressed", self._left_grip_cb, 10)
-        self.create_subscription(Float32, "/q2r_right_trigger_value", self._right_trigger_cb, 10)
-        self.create_subscription(Float32, "/q2r_left_trigger_value", self._left_trigger_cb, 10)
+        if self.handle_right:
+            self.create_subscription(PoseStamped, "/q2r_right_hand_pose", self._right_pose_cb, 10)
+            self.create_subscription(Bool, "/q2r_right_grip_pressed", self._right_grip_cb, 10)
+            self.create_subscription(Float32, "/q2r_right_trigger_value", self._right_trigger_cb, 10)
+        if self.handle_left:
+            self.create_subscription(PoseStamped, "/q2r_left_hand_pose", self._left_pose_cb, 10)
+            self.create_subscription(Bool, "/q2r_left_grip_pressed", self._left_grip_cb, 10)
+            self.create_subscription(Float32, "/q2r_left_trigger_value", self._left_trigger_cb, 10)
 
         # --- Gripper action clients ---
-        self.right_gripper_client = ActionClient(
-            self, GripperCommand, "/right_gripper_controller/gripper_cmd"
-        )
-        self.left_gripper_client = ActionClient(
-            self, GripperCommand, "/left_gripper_controller/gripper_cmd"
-        )
+        if self.handle_right:
+            self.right_gripper_client = ActionClient(
+                self, GripperCommand, "/right_gripper_controller/gripper_cmd"
+            )
+        if self.handle_left:
+            self.left_gripper_client = ActionClient(
+                self, GripperCommand, "/left_gripper_controller/gripper_cmd"
+            )
 
         # --- Publishers ---
-        self.pub_right = self.create_publisher(
-            JointTrajectory, "/right_joint_trajectory_controller/joint_trajectory", 10
-        )
-        self.pub_left = self.create_publisher(
-            JointTrajectory, "/left_joint_trajectory_controller/joint_trajectory", 10
-        )
-        self.get_logger().info("Mode: bimanual joint_trajectory_controller")
+        if self.use_forward:
+            if self.handle_right:
+                self.pub_right = self.create_publisher(
+                    Float64MultiArray, "/right_forward_position_controller/commands", 10
+                )
+            if self.handle_left:
+                self.pub_left = self.create_publisher(
+                    Float64MultiArray, "/left_forward_position_controller/commands", 10
+                )
+            self.get_logger().info(f"Mode: {self.arm_side} forward_position_controller")
+        else:
+            if self.handle_right:
+                self.pub_right = self.create_publisher(
+                    JointTrajectory, "/right_joint_trajectory_controller/joint_trajectory", 10
+                )
+            if self.handle_left:
+                self.pub_left = self.create_publisher(
+                    JointTrajectory, "/left_joint_trajectory_controller/joint_trajectory", 10
+                )
+            self.get_logger().info(f"Mode: {self.arm_side} joint_trajectory_controller")
 
         # --- Control loop at 50 Hz ---
         self.timer = self.create_timer(0.02, self._control_loop)
@@ -173,14 +226,52 @@ class QuestTeleopIKNode(Node):
             f"max_joint_step={self.max_joint_step} rad, max_workspace={tc.max_workspace_radius} m)"
         )
 
+    # ------------------------------------------------------------------ pose filter
+    def _filter_pose(self, old: PoseStamped | None, new: PoseStamped) -> PoseStamped:
+        """Exponential moving average of a Quest pose.
+
+        Position: scalar EMA on each axis.
+        Orientation: EMA on quaternion components (after double-cover sign
+        flip) + renormalize. This is a valid approximation of SLERP for small
+        per-sample deltas, which is what we expect at ~20Hz from Quest.
+        """
+        a = self.pose_filter_alpha
+        if old is None or a >= 0.999:
+            return new
+        out = PoseStamped()
+        out.header = new.header
+        # Position
+        out.pose.position.x = a * new.pose.position.x + (1.0 - a) * old.pose.position.x
+        out.pose.position.y = a * new.pose.position.y + (1.0 - a) * old.pose.position.y
+        out.pose.position.z = a * new.pose.position.z + (1.0 - a) * old.pose.position.z
+        # Orientation: resolve double-cover (pick shorter-path sign) then EMA
+        ow, ox, oy, oz = (old.pose.orientation.w, old.pose.orientation.x,
+                          old.pose.orientation.y, old.pose.orientation.z)
+        nw, nx, ny, nz = (new.pose.orientation.w, new.pose.orientation.x,
+                          new.pose.orientation.y, new.pose.orientation.z)
+        if ow * nw + ox * nx + oy * ny + oz * nz < 0.0:
+            nw, nx, ny, nz = -nw, -nx, -ny, -nz
+        qw = a * nw + (1.0 - a) * ow
+        qx = a * nx + (1.0 - a) * ox
+        qy = a * ny + (1.0 - a) * oy
+        qz = a * nz + (1.0 - a) * oz
+        norm = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+        if norm > 1e-6:
+            qw /= norm; qx /= norm; qy /= norm; qz /= norm
+        out.pose.orientation.w = qw
+        out.pose.orientation.x = qx
+        out.pose.orientation.y = qy
+        out.pose.orientation.z = qz
+        return out
+
     # ------------------------------------------------------------------ callbacks
     def _right_pose_cb(self, msg):
         with self.lock:
-            self.right_pose = msg
+            self.right_pose = self._filter_pose(self.right_pose, msg)
 
     def _left_pose_cb(self, msg):
         with self.lock:
-            self.left_pose = msg
+            self.left_pose = self._filter_pose(self.left_pose, msg)
 
     def _right_grip_cb(self, msg):
         with self.lock:
@@ -221,6 +312,7 @@ class QuestTeleopIKNode(Node):
                 idx = msg.name.index(name)
                 q[i] = msg.position[idx]
         self.q_current = jnp.array(q)
+        self.joint_state_received = True
 
     # ------------------------------------------------------------------ arm target
     def _compute_arm_target(
@@ -311,6 +403,12 @@ class QuestTeleopIKNode(Node):
 
     # ------------------------------------------------------------------ control loop
     def _control_loop(self):
+        # Wait until we've actually seen joint states from the robot —
+        # otherwise cmd_q would snapshot the hardcoded default_config and the
+        # arm would snap to that pose on the first publish.
+        if not self.joint_state_received:
+            return
+
         with self.lock:
             rp = self.right_pose
             lp = self.left_pose
@@ -330,7 +428,7 @@ class QuestTeleopIKNode(Node):
         if target_R is None and target_L is None:
             return
 
-        # Solve IK (both arms simultaneously)
+        # Solve IK
         try:
             new_q = self.solver.solve(target_L, target_R, None, self.q_current)
         except Exception as e:
@@ -363,27 +461,37 @@ class QuestTeleopIKNode(Node):
 
         # Publish right arm
         if self.right.active:
-            stamp = self.get_clock().now().to_msg()
-            msg = JointTrajectory()
-            msg.header.stamp = stamp
-            msg.joint_names = self.right_arm_names
-            pt = JointTrajectoryPoint()
-            pt.positions = [float(self.cmd_q[i]) for i in self.right_arm_indices]
-            pt.time_from_start = Duration(sec=0, nanosec=int(1e7))
-            msg.points = [pt]
-            self.pub_right.publish(msg)
+            if self.use_forward:
+                msg = Float64MultiArray()
+                msg.data = [float(self.cmd_q[i]) for i in self.right_arm_indices]
+                self.pub_right.publish(msg)
+            else:
+                stamp = self.get_clock().now().to_msg()
+                msg = JointTrajectory()
+                msg.header.stamp = stamp
+                msg.joint_names = self.right_arm_names
+                pt = JointTrajectoryPoint()
+                pt.positions = [float(self.cmd_q[i]) for i in self.right_arm_indices]
+                pt.time_from_start = Duration(sec=0, nanosec=int(1e7))
+                msg.points = [pt]
+                self.pub_right.publish(msg)
 
         # Publish left arm
         if self.left.active:
-            stamp = self.get_clock().now().to_msg()
-            msg = JointTrajectory()
-            msg.header.stamp = stamp
-            msg.joint_names = self.left_arm_names
-            pt = JointTrajectoryPoint()
-            pt.positions = [float(self.cmd_q[i]) for i in self.left_arm_indices]
-            pt.time_from_start = Duration(sec=0, nanosec=int(1e7))
-            msg.points = [pt]
-            self.pub_left.publish(msg)
+            if self.use_forward:
+                msg = Float64MultiArray()
+                msg.data = [float(self.cmd_q[i]) for i in self.left_arm_indices]
+                self.pub_left.publish(msg)
+            else:
+                stamp = self.get_clock().now().to_msg()
+                msg = JointTrajectory()
+                msg.header.stamp = stamp
+                msg.joint_names = self.left_arm_names
+                pt = JointTrajectoryPoint()
+                pt.positions = [float(self.cmd_q[i]) for i in self.left_arm_indices]
+                pt.time_from_start = Duration(sec=0, nanosec=int(1e7))
+                msg.points = [pt]
+                self.pub_left.publish(msg)
 
         self.publish_count += 1
         if self.publish_count % 250 == 1:
@@ -395,8 +503,10 @@ class QuestTeleopIKNode(Node):
             self.get_logger().info(f"#{self.publish_count} active=[{','.join(active)}]")
 
         # Grippers
-        self._handle_gripper(self.right, self.right_gripper_client)
-        self._handle_gripper(self.left, self.left_gripper_client)
+        if self.handle_right:
+            self._handle_gripper(self.right, self.right_gripper_client)
+        if self.handle_left:
+            self._handle_gripper(self.left, self.left_gripper_client)
 
 
 def main(args=None):
